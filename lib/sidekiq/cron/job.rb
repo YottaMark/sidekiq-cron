@@ -17,6 +17,8 @@ module Sidekiq
       #crucial part of whole enquing job
       def should_enque? time
         enqueue = false
+        return enqueue if unique_in_queue_and_active?
+
         enqueue = Sidekiq.redis do |conn|
           status == "enabled" &&
             not_past_scheduled_time?(time) &&
@@ -24,6 +26,32 @@ module Sidekiq
             conn.zadd(job_enqueued_key, formated_enqueue_time(time), formated_last_time(time))
         end
         enqueue
+      end
+
+      # Check queue for active job in job queue if setting is true
+      def unique_in_queue_and_active?
+        return false unless @unique_in_queue.downcase == 'true'
+        return true if active_worker?
+        return true if enqueued_worker?
+
+        false
+      end
+
+      # Are any jobs in the queue currently running?
+      def active_worker?
+        workers = Sidekiq::Workers.new
+        workers.each do |_process_id, _thread_id, work|
+          return true if work['queue'] == @queue_name_with_prefix
+        end
+        false
+      end
+
+      # Are any jobs in the queue with the same queue name?
+      def enqueued_worker?
+        queue = Sidekiq::Queue.new(@queue_name_with_prefix)
+        return true if queue.size.positive?
+
+        false
       end
 
       # remove previous informations about run times
@@ -47,6 +75,8 @@ module Sidekiq
 
       #enque cron job to queue
       def enque! time = Time.now.utc
+        return if unique_in_queue_and_active?
+
         @last_enqueue_time = time.strftime(LAST_ENQUEUE_TIME_FORMAT)
 
         klass_const =
@@ -125,6 +155,7 @@ module Sidekiq
           'wrapped'      => @klass,
           'queue'        => @queue_name_with_prefix,
           'description'  => @description,
+          'unique_in_queue' => @unique_in_queue,
           'args'         => [{
             'job_class'  => @klass,
             'job_id'     => SecureRandom.uuid,
@@ -253,7 +284,8 @@ module Sidekiq
         end
       end
 
-      attr_accessor :name, :cron, :description, :klass, :args, :message
+      attr_accessor :name, :cron, :description, :klass, :args, :message,
+                    :unique_in_queue
       attr_reader   :last_enqueue_time, :fetch_missing_args
 
       def initialize input_args = {}
@@ -264,6 +296,7 @@ module Sidekiq
         @name = args["name"]
         @cron = args["cron"]
         @description = args["description"] if args["description"]
+        @unique_in_queue = args["unique_in_queue"] if args["unique_in_queue"]
 
         #get class from klass or class
         @klass = args["klass"] || args["class"]
@@ -394,6 +427,7 @@ module Sidekiq
           klass: @klass,
           cron: @cron,
           description: @description,
+          unique_in_queue: @unique_in_queue,
           args: @args.is_a?(String) ? @args : Sidekiq.dump_json(@args || []),
           message: @message.is_a?(String) ? @message : Sidekiq.dump_json(@message || {}),
           status: @status,
